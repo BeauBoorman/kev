@@ -1,5 +1,5 @@
 """The kev-finetune skill's local scripts (skills/kev-finetune/scripts): record validation, state-grouped splitting,
-generator prompt/balancing and response parsing. Standard library only, no network.
+generator prompt/balancing and response parsing; the kev-deploy Modal configuration. No network.
 Run: uv run python -m pytest tests/test_skill_scripts.py -q
 """
 import json
@@ -19,6 +19,60 @@ import plan_size  # noqa: E402
 import split_data  # noqa: E402
 
 SPEC = json.loads((SKILL / "assets/workload.example.json").read_text(encoding="utf-8"))
+
+
+def modal_deployment(monkeypatch, **settings):
+    import modal
+    import runpy
+    for key in ("KEV_MODEL", "KEV_APP_NAME", "KEV_MIN_CONTAINERS", "KEV_GPU", "KEV_REGION", "KEV_FLASH",
+                "KEV_TRUNCATE_STATES", "KEV_API_KEY", "KEV_HF_SECRET"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in settings.items(): monkeypatch.setenv(key, value)
+    options = {}
+    for method in ("cls", "server"):
+        original = getattr(modal.App, method)
+        def register(self, _method=method, _original=original, **kwargs):
+            options[_method] = kwargs
+            return _original(self, **kwargs)
+        monkeypatch.setattr(modal.App, method, register)
+    concurrent = modal.concurrent
+    def concurrency(**kwargs):
+        options["concurrent"] = kwargs
+        return concurrent(**kwargs)
+    monkeypatch.setattr(modal, "concurrent", concurrency)
+    module = runpy.run_path(str(ROOT / "skills/kev-deploy/scripts/kev_serve.py"))
+    return module, options
+
+
+def test_modal_web_deployment_preserves_concurrency_and_scale_to_zero(monkeypatch):
+    import modal
+    module, options = modal_deployment(monkeypatch, KEV_API_KEY="pilot-test-key")
+    assert isinstance(module["Kev"], modal.Cls) and "server" not in options
+    assert options["concurrent"] == {"max_inputs": 64, "target_inputs": 32}
+    assert options["cls"]["min_containers"] == 0 and options["cls"]["region"] is None
+    assert options["cls"]["timeout"] == 600 and options["cls"]["startup_timeout"] == 1200
+    assert len(options["cls"]["secrets"]) == 1
+    assert module["SECRET"]["KEV_API_KEY"] == "pilot-test-key"
+
+
+@pytest.mark.parametrize("minimum, expected", [("0", 1), ("2", 2)])
+def test_modal_direct_server_uses_native_concurrency_and_application_auth(monkeypatch, minimum, expected):
+    import modal
+    module, options = modal_deployment(monkeypatch, KEV_FLASH="1", KEV_REGION="us-east,us-west",
+                                       KEV_MIN_CONTAINERS=minimum, KEV_API_KEY="pilot-test-key", KEV_TRUNCATE_STATES="1")
+    assert isinstance(module["Kev"], modal.Server)
+    assert "cls" not in options and "concurrent" not in options
+    server = options["server"]
+    assert server["target_concurrency"] == 64 and server["min_containers"] == expected
+    assert server["compute_region"] == ["us-east", "us-west"] and server["routing_region"] == "us-east"
+    assert server["port"] == 8000 and server["startup_timeout"] == 1200 and server["exit_grace_period"] == 120
+    assert server["unauthenticated"] is True and len(server["secrets"]) == 1   # Kev, not Modal's proxy, checks the bearer
+    assert module["SECRET"]["KEV_API_KEY"] == "pilot-test-key" and module["SETTINGS"]["KEV_TRUNCATE_STATES"] == "1"
+
+
+def test_modal_direct_server_requires_a_routing_region(monkeypatch):
+    with pytest.raises(SystemExit, match="set KEV_REGION"):
+        modal_deployment(monkeypatch, KEV_FLASH="1")
 
 
 def record(state, dept="billing", urgent=True, level=1):
