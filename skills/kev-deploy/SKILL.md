@@ -2,7 +2,7 @@
 name: kev-deploy
 description: Deploy a Kev decision model (the open Jev-style System One model) as the user's own TypeSafe-compatible HTTPS endpoint on Modal with one command, wire it into their code, and take it down. Use when someone wants to host Kev, get a Kev API URL, replace Jev / TypeSafe calls with a self-hosted model, pick a Kev size or GPU, add an API key, keep an endpoint warm, or stop and remove a Kev deployment.
 license: Apache-2.0
-compatibility: Requires Python 3.10+ and a Modal account (`pip install modal && modal setup`, free tier works for the small models). No GPU, no clone of the Kev repo, no Hugging Face account for the public checkpoints.
+compatibility: Requires Python 3.10+ and a Modal account (`pip install modal==1.5.5 && modal setup`, free tier works for the small models). No GPU, no clone of the Kev repo, no Hugging Face account for the public checkpoints.
 metadata:
   author: jaredpalmer
   version: "1.1"
@@ -19,7 +19,7 @@ The file is short on purpose: if the user's case does not fit, read it and edit 
 ## 1. Check the prerequisites
 
 ```bash
-python3 -c "import modal" 2>/dev/null || pip install modal
+pip install modal==1.5.5
 modal profile current 2>/dev/null || modal setup      # opens a browser to sign in; the user must do this step
 modal skills install -y                               # optional: Modal's own agent skill + docs (into .agents/, or -g for home)
 ```
@@ -72,16 +72,33 @@ of refusing it (see Long documents under Troubleshooting).
 
 A container answers concurrent requests in batches: its model thread takes everything waiting and runs it through shared
 passes. In-process, Kev-4B on an H100 serves about 95 six-question requests/s (120 on mixed short records); an L40S about
-45. Over HTTP the front door matters more than the GPU (Kev-4B, H100, a client in the same region, measured 2026-09-24):
+45. Over HTTP the front door matters too: `KEV_FLASH=1` uses a Modal Server rather than the Function input plane, with
+the same Uvicorn/FastAPI API, GPU worker and bearer check. It now targets 64 concurrent requests per container instead
+of 32. The ordinary web endpoint retains its 64-input burst limit and autoscaling target of 32: experiments with
+128/32 and 128/64 regressed throughput and median latency, so neither is shipped.
 
-| Front door | One request, round trip | 8 / 32 concurrent clients | Scaling |
-| --- | --- | --- | --- |
-| web endpoint (default) | ~77 ms | 77 / 103 req/s | Modal adds containers past 32 concurrent requests each |
-| `KEV_FLASH=1` (experimental) | ~46 ms | 70 / 112 req/s per container | one container stays up; past ~32 concurrent per container requests queue at the proxy (p99 ~4 s at 64) |
+The [paired HTTP benchmark](../../runs/modal-http-4b-h100/report.json) uses Kev-4B on one H100 per variant, four CPUs,
+`us-east`, an in-region client, kept-alive connections and six questions per request. At one client, warm p50 fell
+from 81 to 34 ms. At 64 clients, p50 fell from 1,236 to 652 ms and throughput rose from 44 to 66 requests/s; p99 was
+4.5 versus 4.0 seconds, **not** halved. The rejected web 128/32 variant fell to 37 requests/s at 64 clients. A
+[separate 128/64 pilot](../../runs/modal-http-4b-h100/target64/report.json) fell from 56 to 36 requests/s there.
+Both runs used the same checkpoint per variant and returned identical six-question answers and no HTTP errors.
+An [actual deployment-script smoke](../../runs/modal-http-4b-h100/deploy-smoke/report.json), built independently from the
+pinned Git commit, also checked bearer auth, request validation, the SDK, answer parity against the paired run and
+20 warm serial requests (model p50 18.4 ms; its client is not in-region, so its RTT is not a paired comparison).
+The reports record end-to-end, process and model time separately, status errors and CUDA graph counts. The model path and deployment image are unchanged;
+the fused DeltaNet forward uses FLA's own convolution. Shape capture can still happen during a load phase;
+these are small pilots, not a sustained traffic or autoscaling SLO. Reproduce from the repository:
 
-For steady high traffic, keep containers warm (`KEV_MIN_CONTAINERS=2` or more) so bursts do not wait for a cold start, and
-size it at about 32 concurrent requests per container. `KEV_FLASH=1` needs `KEV_REGION` (its proxy is regional) and its
-URL is printed as `https://<workspace>--<app>-kev.<region>.modal.direct`.
+```bash
+uv run --extra serve modal run scripts/modal_http_bench.py --out runs/modal-http-4b-h100 --levels 1,32,64,128
+```
+
+Direct mode remains opt-in: set `KEV_FLASH=1 KEV_REGION=us-east` before the deployment command in Step 3. It requires Modal 1.5.5,
+prints `https://<workspace>--<app>-kev.<region>.modal.direct`, and keeps at least one paid GPU container up. It can return
+503 while starting; warm it with a redirect-following `/v1/models` call before routing traffic. For steady high traffic,
+keep enough containers warm (`KEV_MIN_CONTAINERS=2` or more) so bursts do not wait for a cold start. Both front doors
+still queue under overload: a 64-request target is not a promise of low p99 at 128 clients.
 
 ## 4. Verify
 
