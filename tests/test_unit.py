@@ -2502,3 +2502,300 @@ def test_release_date_skips_zeroed_mtimes_and_uses_utc(tmp_path, monkeypatch):
     assert ck.release_date() == "2026-09-29" and calls == [("jaredpalmer/kev-x", "v1.0")]
     ck.requested = "down/kev"
     assert ck.release_date() == "unknown"                                      # offline: the cached files' rule
+
+
+LEVELS_3 = ["low", "medium", "high"]   # jaredpalmer/kev#161's three urgency levels
+
+
+def _score_fake(fn):
+    """A predictor stand-in for scripts/score_presentation_checks.py: fn(criteria) -> (probabilities, logits) for
+    the one Score question, keyed the way LocalPredictor keys them (kev.api.question_keys)."""
+    from kev.api import question_keys
+
+    def predict(record):
+        qid, q = next(iter(record["questions"].items()))
+        p, z = fn(q["criteria"])
+        keys = question_keys("score", q["criteria"])
+        return {"probabilities": {qid: dict(zip(keys, p))}, "logits": {qid: dict(zip(keys, z))}}
+    return predict
+
+
+def test_score_presentation_checks_slot_bias_and_text_driven_fakes():
+    """scripts/score_presentation_checks.py (#161): a fake that peaks at slot 0 wherever the texts sit pins the
+    first-slot rate at 1.0 (tie_rate 0); a text-driven fake, whose winner permutes with the criteria, sits at
+    exactly 1/K over all K! orders with the per-slot rates even; the order sample is capped deterministically
+    when K! overflows, without listing K!."""
+    import scripts.score_presentation_checks as checks
+
+    positional = _score_fake(lambda crit: ([0.7] + [0.15] * (len(crit) - 1), [1.0] + [0.0] * (len(crit) - 1)))
+    report = checks.first_slot_rate(positional, LEVELS_3, ["s1", "s2"], checks.level_orders(3, 120))
+    assert report["first_slot_rate"] == 1.0 and report["tie_rate"] == 0.0 and report["n_ties"] == 0
+    assert report["expected"] == 1 / 3 and report["n_decisions"] == 12
+
+    def by_text(crit):
+        win = crit.index("medium")
+        p = [0.0] * len(crit); p[win] = 0.9; p[(win + 1) % len(crit)] = 0.1
+        return p, [3.0 if i == win else 0.0 for i in range(len(crit))]
+
+    fair = _score_fake(by_text)
+    report = checks.first_slot_rate(fair, LEVELS_3, ["s1", "s2", "s3"], checks.level_orders(3, 120))
+    assert report["first_slot_rate"] == report["expected"] and report["tie_rate"] == 0.0
+    assert report["per_slot_rates"] == [1 / 3] * 3
+    every = checks.level_orders(3, 120)
+    assert len(every) == 6 and len({tuple(o) for o in every}) == 6
+    sample = checks.level_orders(8, 10)
+    assert len(sample) == 10 and len({tuple(o) for o in sample}) == 10 and sample == checks.level_orders(8, 10)
+    assert all(sorted(order) == list(range(8)) for order in sample)
+
+
+def test_score_presentation_checks_ties_split_the_win_and_a_flat_head_is_the_null():
+    """scripts/score_presentation_checks.py (#161): an exact tie splits the win, it is not awarded to slot 0
+    (max(..., key=) would). A flat head is the 1/K null: first_slot_rate == 1/K and tie_rate == 1, not 1.0."""
+    from scripts.score_presentation_checks import first_slot_rate
+
+    tied = _score_fake(lambda crit: ([0.4, 0.4, 0.2], [1.0, 1.0, 0.0]))
+    report = first_slot_rate(tied, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == pytest.approx(0.5) and report["tie_rate"] == 1.0 and report["n_ties"] == 1
+    assert report["per_slot_rates"] == pytest.approx([0.5, 0.5, 0.0])
+
+    flat = _score_fake(lambda crit: ([1 / len(crit)] * len(crit), [0.0] * len(crit)))
+    report = first_slot_rate(flat, LEVELS_3, ["s1", "s2"], [(0, 1, 2), (2, 1, 0)])
+    assert report["first_slot_rate"] == pytest.approx(report["expected"]) and report["first_slot_rate"] != 1.0
+    assert report["tie_rate"] == 1.0 and report["n_ties"] == report["n_decisions"] == 4
+    assert report["per_slot_rates"] == pytest.approx([1 / 3] * 3)
+
+
+def test_score_presentation_checks_identical_option_is_one_call_per_state(monkeypatch):
+    """scripts/score_presentation_checks.py (#161): identical texts make every permutation the same request, so
+    the control is one predictor call per state. It does not call level_orders(k, K!) or score K! times, and a
+    sample past --orders-max does not materialise K! either."""
+    import itertools
+    import scripts.score_presentation_checks as checks
+
+    calls = []
+
+    def predict(record):
+        calls.append(record["state"])
+        qid, q = next(iter(record["questions"].items()))
+        from kev.api import question_keys
+        keys = question_keys("score", q["criteria"])
+        z = [1.0] + [0.0] * (len(keys) - 1)
+        return {"logits": {qid: dict(zip(keys, z))}, "probabilities": {qid: {key: 0.0 for key in keys}}}
+
+    report = checks.identical_option_control(predict, "same", 8, ["s1", "s2"])
+    assert calls == ["s1", "s2"] and report["n_decisions"] == 2 and report["space"] == "logits"
+    assert report["control"] == pytest.approx(1.0 - 1 / 8) and report["per_slot_means"] == [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert "n_orders" not in report
+
+    real = itertools.permutations
+
+    def refuse_long(iterable, r=None):
+        seq = list(iterable)
+        if len(seq) >= 8:
+            raise AssertionError(f"K! must not be materialised (permutations of {len(seq)})")
+        return real(seq, r) if r is not None else real(seq)
+
+    monkeypatch.setattr(checks.itertools, "permutations", refuse_long)
+    calls.clear()
+    report = checks.measure(predict, [f"L{i}" for i in range(8)], states=["s1"], orders_max=5)
+    assert calls == ["s1"] * 6                                  # 5 sampled orders + one identical-option call
+    assert report["first_slot"]["n_orders"] == 5 and report["identical_option"]["n_decisions"] == 1
+    sample = checks.level_orders(12, 3)                         # 12! is 479,001,600; listing it is the bug
+    assert len(sample) == 3 and len({tuple(order) for order in sample}) == 3
+    assert all(sorted(order) == list(range(12)) for order in sample)
+
+
+def test_score_presentation_checks_identical_option_reads_logits_then_probabilities():
+    """scripts/score_presentation_checks.py (#161): the identical-option control reads logits when the predictor
+    reports them (the issue's numbers are logit-space) and falls back to probabilities; a flat head measures 0."""
+    from kev.api import question_keys
+    from scripts.score_presentation_checks import identical_option_control
+
+    peaked = _score_fake(lambda crit: ([0.8, 0.1, 0.1], [1.0] + [0.0] * (len(crit) - 1)))
+    report = identical_option_control(peaked, "same", 3, ["s1"])
+    assert report["space"] == "logits" and report["control"] == pytest.approx(1.0 - 1 / 3)
+    assert report["per_slot_means"] == [1.0, 0.0, 0.0]
+
+    class NoLogits:
+        def __call__(self, record):
+            qid, q = next(iter(record["questions"].items()))
+            keys = question_keys("score", q["criteria"])
+            return {"probabilities": {qid: {key: 1 / len(keys) for key in keys}}}
+
+    flat = identical_option_control(NoLogits(), "same", 3, ["s1"])
+    assert flat["space"] == "probabilities" and flat["control"] == 0.0
+
+
+def test_score_presentation_checks_request_is_a_valid_serving_record():
+    """scripts/score_presentation_checks.py (#161): the requests it asks validate against the serving schema and
+    carry the label materialize needs (report-only: no accuracy is claimed from it); a predictor answering in
+    neither space is refused."""
+    from scripts.score_presentation_checks import first_slot_rate, score_request
+    from kev.api import SystemOneRequest
+    from kev.data import materialize
+
+    req = score_request("Ticket 1: the VPN drops every ten minutes.", LEVELS_3, label=2)
+    assert SystemOneRequest.model_validate(req)
+    rec = materialize(req)
+    assert rec["questions"][0]["label"] == 2 and rec["questions"][0]["qtype"] == "score"
+
+    with pytest.raises(ValueError):
+        first_slot_rate(lambda record: {}, LEVELS_3, ["s1"], [(0, 1, 2)])
+
+
+def test_score_presentation_checks_report_carries_the_ordered_scale_caveat():
+    """scripts/score_presentation_checks.py (#161): the report says, next to the numbers, that Score levels are an
+    ordered scale — so a high first-slot rate mixes position bias with order-as-meaning and is not read as pure
+    bias on its own (jaredpalmer's review of #232)."""
+    from scripts.score_presentation_checks import ORDERED_SCALE_CAVEAT, measure
+
+    def by_text(crit):
+        win = crit.index("medium") if "medium" in crit else 0   # the identical-option control repeats one text
+        p = [0.0] * len(crit); p[win] = 0.9; p[(win + 1) % len(crit)] = 0.1
+        return p, [3.0 if i == win else 0.0 for i in range(len(crit))]
+
+    report = measure(_score_fake(by_text), LEVELS_3, states=["s1", "s2"])
+    assert report["caveat"] == ORDERED_SCALE_CAVEAT
+    assert "ordered scale" in report["caveat"] and "identical-option" in report["caveat"]
+    assert "pure bias" in report["caveat"]
+    assert {"first_slot", "identical_option", "caveat"} <= set(report)   # it rides in the JSON report itself
+    assert report["identical_option"]["n_decisions"] == 2                 # one call per state, not 2 x 3!
+
+
+def test_score_presentation_checks_states_limit_applies_to_data(tmp_path, monkeypatch, capsys):
+    """scripts/score_presentation_checks.py (#161): --states limits --data to the first that many rows
+    (read through kev.suite.read_jsonl). A flat head on that slice sits at the 1/K null."""
+    import json
+    from kev.suite import write_jsonl
+    import scripts.score_presentation_checks as checks
+
+    path = tmp_path / "rows.jsonl"
+    write_jsonl(path, [{"state": f"row {i}"} for i in range(4)])
+    seen = []
+
+    def predict(record):
+        seen.append(record["state"])
+        qid, q = next(iter(record["questions"].items()))
+        from kev.api import question_keys
+        keys = question_keys("score", q["criteria"])
+        return {"probabilities": {qid: {key: 1 / len(keys) for key in keys}}}
+
+    monkeypatch.setattr(checks, "build_predictor", lambda args: predict)
+    assert checks.main(["--run", "unused", "--data", str(path), "--states", "2",
+                        "--level-texts", "low,medium,high", "--orders-max", "120"]) == 0
+    assert set(seen) == {"row 0", "row 1"} and len(seen) == 14          # 2 states x 6 orders, plus 2 control calls
+    out = json.loads(capsys.readouterr().out)
+    assert out["n_states"] == 2 and out["first_slot"]["n_decisions"] == 12
+    assert out["first_slot"]["first_slot_rate"] == pytest.approx(1 / 3) and out["first_slot"]["tie_rate"] == 1.0
+    assert out["identical_option"]["n_decisions"] == 2 and out["identical_option"]["control"] == 0.0
+    assert checks.build_states(2, [{"state": "a"}, {"state": "b"}, {"state": "c"}]) == ["a", "b"]
+    assert checks.build_states(20, [{"state": "only"}]) == ["only"]          # a short file asks what it has
+    with pytest.raises(ValueError):
+        checks.build_states(2, [{"nope": 1}])
+    from kev.suite import SERVING_CONTEXT
+    assert out["context"] == {key: SERVING_CONTEXT[key] for key in ("max_state", "max_branch", "max_packed")}
+
+
+def test_score_presentation_checks_edges_k_ties_and_which_space_decides():
+    """K=1 has one order and a zero control. An exact tie that does not include slot 0 leaves the first-slot rate at 0.
+    A near-tie is a unique maximum. Probabilities decide when both spaces exist, including when they disagree."""
+    from scripts.score_presentation_checks import first_slot_rate, identical_option_control, level_orders
+
+    one = _score_fake(lambda crit: ([1.0], [0.3]))
+    report = first_slot_rate(one, ["only"], ["s1"], level_orders(1, 120))
+    assert level_orders(1, 120) == [(0,)] and report["first_slot_rate"] == 1.0 and report["tie_rate"] == 0.0
+    assert report["expected"] == 1.0 and report["n_decisions"] == 1
+    assert identical_option_control(one, "only", 1, ["s1"])["control"] == 0.0
+    both = level_orders(2, 120)
+    assert len(both) == 2 and {tuple(order) for order in both} == {(0, 1), (1, 0)}
+
+    off = _score_fake(lambda crit: ([0.2, 0.4, 0.4], [0.0, 1.0, 1.0]))
+    report = first_slot_rate(off, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == 0.0 and report["tie_rate"] == 1.0
+    assert report["per_slot_rates"] == pytest.approx([0.0, 0.5, 0.5])
+
+    near = _score_fake(lambda crit: ([0.4, 0.4000001, 0.2], [0.0, 1e-9, -1.0]))
+    report = first_slot_rate(near, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == 0.0 and report["tie_rate"] == 0.0 and report["per_slot_rates"][1] == 1.0
+
+    # The served answer is the probability argmax. Logits that point the other way do not override it.
+    disagree = _score_fake(lambda crit: ([0.0, 0.0, 1.0], [5.0, 0.0, 0.0]))
+    report = first_slot_rate(disagree, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == 0.0 and report["per_slot_rates"] == [0.0, 0.0, 1.0]
+    tied_p = _score_fake(lambda crit: ([0.5, 0.5, 0.0], [1.0, 0.9, 0.0]))
+    report = first_slot_rate(tied_p, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == pytest.approx(0.5) and report["tie_rate"] == 1.0
+
+
+def test_score_presentation_checks_non_finite_scores_are_refused():
+    """A NaN in the space being read is not a tie and not a winner. Probabilities are read first for the slot rate,
+    logits first for the control, so a non-finite value in the other space is ignored."""
+    from scripts.score_presentation_checks import first_slot_rate, identical_option_control
+
+    nan_p = _score_fake(lambda crit: ([float("nan"), 0.5, 0.5], [0.0, 0.0, 0.0]))
+    with pytest.raises(ValueError, match="non-finite"):
+        first_slot_rate(nan_p, LEVELS_3, ["s1"], [(0, 1, 2)])
+    inf_z = _score_fake(lambda crit: ([0.2, 0.3, 0.5], [0.0, float("inf"), 0.0]))
+    with pytest.raises(ValueError, match="non-finite"):
+        identical_option_control(inf_z, "same", 3, ["s1"])
+    # Slot rate reads probabilities and never reaches these logits.
+    finite_p = _score_fake(lambda crit: ([0.2, 0.3, 0.5], [float("nan"), 0.0, 0.0]))
+    report = first_slot_rate(finite_p, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == 0.0 and report["per_slot_rates"][2] == 1.0 and report["tie_rate"] == 0.0
+
+
+def test_score_presentation_checks_levels_and_empty_data_fail_before_the_checkpoint(tmp_path, monkeypatch):
+    """--levels is the count when --level-texts is omitted (3 stays low/medium/high; 4 is level 1..4). An empty
+    --data, a count that disagrees with the texts, and --raw-logits on a remote endpoint all stop before a checkpoint
+    is loaded. The local predictor is constructed at the serving context, not the 384-token training window."""
+    import scripts.score_presentation_checks as checks
+    from kev.suite import CONTEXT, SERVING_CONTEXT
+
+    seen = []
+
+    def predict(record):
+        q = next(iter(record["questions"].values()))
+        seen.append(list(q["criteria"]))
+        from kev.api import question_keys
+        keys = question_keys("score", q["criteria"])
+        return {"probabilities": {next(iter(record["questions"])): {key: 1 / len(keys) for key in keys}}}
+
+    captured = {}
+
+    class FakeLocal:
+        def __init__(self, run, device, opts=None, context=None):
+            captured.update(run=run, device=device, temperature=opts.temperature, context=context)
+
+    monkeypatch.setattr("kev.predictors.LocalPredictor", FakeLocal)
+    args = SimpleNamespace(run="jaredpalmer/kev-0.8b", remote=None, device="cpu", raw_logits=True,
+                           model="kev-latest", api_key="local")
+    checks.build_predictor(args)
+    assert captured["context"] == SERVING_CONTEXT and captured["context"]["max_state"] != CONTEXT["max_state"]
+    assert captured["temperature"] == 1.0 and captured["device"] == "cpu"
+    args.raw_logits = False
+    checks.build_predictor(args)
+    assert captured["temperature"] is None
+    with pytest.raises(SystemExit, match="remote endpoint"):
+        checks.build_predictor(SimpleNamespace(run=None, remote="http://example.invalid", raw_logits=True,
+                                               device="cpu", model="kev-latest", api_key="local"))
+
+    def refuse(args):
+        raise AssertionError("checkpoint loaded")
+
+    monkeypatch.setattr(checks, "build_predictor", refuse)
+    (tmp_path / "empty.jsonl").write_text("\n\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="no rows"):
+        checks.main(["--run", "unused", "--data", str(tmp_path / "empty.jsonl")])
+    with pytest.raises(SystemExit, match="--levels is 4"):
+        checks.main(["--run", "unused", "--levels", "4", "--level-texts", "a,b,c"])
+    with pytest.raises(SystemExit, match="--levels must be >= 1"):
+        checks.main(["--run", "unused", "--levels", "0"])
+
+    monkeypatch.setattr(checks, "build_predictor", lambda args: predict)
+    assert checks.main(["--run", "unused", "--states", "1", "--orders-max", "1"]) == 0
+    assert sorted(seen[0]) == ["high", "low", "medium"] and seen[-1] == ["low", "low", "low"]
+    assert len(seen) == 2                                                    # one sampled order + the control
+    seen.clear()
+    assert checks.main(["--run", "unused", "--levels", "4", "--states", "1", "--orders-max", "2"]) == 0
+    assert all(sorted(row) == ["level 1", "level 2", "level 3", "level 4"] for row in seen[:-1])
+    assert seen[-1] == ["level 1"] * 4 and len(seen) == 3                    # 2 orders + one control call
