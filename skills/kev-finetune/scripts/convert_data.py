@@ -14,6 +14,7 @@ import csv
 import json
 import sys
 from collections import Counter
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -60,9 +61,11 @@ def map_label(q, value, mapping, score_offset):
         return (hits[0], None) if len(hits) == 1 else (None, "not an option (use --map)")
     levels = q["criteria"]
     try:
-        index = int(float(text)) - score_offset
-        return (index, None) if 0 <= index < len(levels) else (None, f"level outside 0..{len(levels) - 1} after --score-offset {score_offset}")
-    except ValueError:
+        number = Decimal(text)
+        if not number.is_finite() or number != number.to_integral_value():
+            return None, "score must be a finite integer index"
+        return (int(number) - score_offset, None) if score_offset <= number < score_offset + len(levels) else (None, f"level outside 0..{len(levels) - 1} after --score-offset {score_offset}")
+    except InvalidOperation:
         hits = [i for i, lvl in enumerate(levels) if str(lvl).casefold() == text.casefold() or str(lvl).casefold().startswith(text.casefold() + ":")]
         return (hits[0], None) if len(hits) == 1 else (None, "not a level (index or level text)")
 
