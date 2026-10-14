@@ -2692,3 +2692,110 @@ def test_score_presentation_checks_states_limit_applies_to_data(tmp_path, monkey
     assert checks.build_states(20, [{"state": "only"}]) == ["only"]          # a short file asks what it has
     with pytest.raises(ValueError):
         checks.build_states(2, [{"nope": 1}])
+    from kev.suite import SERVING_CONTEXT
+    assert out["context"] == {key: SERVING_CONTEXT[key] for key in ("max_state", "max_branch", "max_packed")}
+
+
+def test_score_presentation_checks_edges_k_ties_and_which_space_decides():
+    """K=1 has one order and a zero control. An exact tie that does not include slot 0 leaves the first-slot rate at 0.
+    A near-tie is a unique maximum. Probabilities decide when both spaces exist, including when they disagree."""
+    from scripts.score_presentation_checks import first_slot_rate, identical_option_control, level_orders
+
+    one = _score_fake(lambda crit: ([1.0], [0.3]))
+    report = first_slot_rate(one, ["only"], ["s1"], level_orders(1, 120))
+    assert level_orders(1, 120) == [(0,)] and report["first_slot_rate"] == 1.0 and report["tie_rate"] == 0.0
+    assert report["expected"] == 1.0 and report["n_decisions"] == 1
+    assert identical_option_control(one, "only", 1, ["s1"])["control"] == 0.0
+    both = level_orders(2, 120)
+    assert len(both) == 2 and {tuple(order) for order in both} == {(0, 1), (1, 0)}
+
+    off = _score_fake(lambda crit: ([0.2, 0.4, 0.4], [0.0, 1.0, 1.0]))
+    report = first_slot_rate(off, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == 0.0 and report["tie_rate"] == 1.0
+    assert report["per_slot_rates"] == pytest.approx([0.0, 0.5, 0.5])
+
+    near = _score_fake(lambda crit: ([0.4, 0.4000001, 0.2], [0.0, 1e-9, -1.0]))
+    report = first_slot_rate(near, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == 0.0 and report["tie_rate"] == 0.0 and report["per_slot_rates"][1] == 1.0
+
+    # The served answer is the probability argmax. Logits that point the other way do not override it.
+    disagree = _score_fake(lambda crit: ([0.0, 0.0, 1.0], [5.0, 0.0, 0.0]))
+    report = first_slot_rate(disagree, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == 0.0 and report["per_slot_rates"] == [0.0, 0.0, 1.0]
+    tied_p = _score_fake(lambda crit: ([0.5, 0.5, 0.0], [1.0, 0.9, 0.0]))
+    report = first_slot_rate(tied_p, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == pytest.approx(0.5) and report["tie_rate"] == 1.0
+
+
+def test_score_presentation_checks_non_finite_scores_are_refused():
+    """A NaN in the space being read is not a tie and not a winner. Probabilities are read first for the slot rate,
+    logits first for the control, so a non-finite value in the other space is ignored."""
+    from scripts.score_presentation_checks import first_slot_rate, identical_option_control
+
+    nan_p = _score_fake(lambda crit: ([float("nan"), 0.5, 0.5], [0.0, 0.0, 0.0]))
+    with pytest.raises(ValueError, match="non-finite"):
+        first_slot_rate(nan_p, LEVELS_3, ["s1"], [(0, 1, 2)])
+    inf_z = _score_fake(lambda crit: ([0.2, 0.3, 0.5], [0.0, float("inf"), 0.0]))
+    with pytest.raises(ValueError, match="non-finite"):
+        identical_option_control(inf_z, "same", 3, ["s1"])
+    # Slot rate reads probabilities and never reaches these logits.
+    finite_p = _score_fake(lambda crit: ([0.2, 0.3, 0.5], [float("nan"), 0.0, 0.0]))
+    report = first_slot_rate(finite_p, LEVELS_3, ["s1"], [(0, 1, 2)])
+    assert report["first_slot_rate"] == 0.0 and report["per_slot_rates"][2] == 1.0 and report["tie_rate"] == 0.0
+
+
+def test_score_presentation_checks_levels_and_empty_data_fail_before_the_checkpoint(tmp_path, monkeypatch):
+    """--levels is the count when --level-texts is omitted (3 stays low/medium/high; 4 is level 1..4). An empty
+    --data, a count that disagrees with the texts, and --raw-logits on a remote endpoint all stop before a checkpoint
+    is loaded. The local predictor is constructed at the serving context, not the 384-token training window."""
+    import scripts.score_presentation_checks as checks
+    from kev.suite import CONTEXT, SERVING_CONTEXT
+
+    seen = []
+
+    def predict(record):
+        q = next(iter(record["questions"].values()))
+        seen.append(list(q["criteria"]))
+        from kev.api import question_keys
+        keys = question_keys("score", q["criteria"])
+        return {"probabilities": {next(iter(record["questions"])): {key: 1 / len(keys) for key in keys}}}
+
+    captured = {}
+
+    class FakeLocal:
+        def __init__(self, run, device, opts=None, context=None):
+            captured.update(run=run, device=device, temperature=opts.temperature, context=context)
+
+    monkeypatch.setattr("kev.predictors.LocalPredictor", FakeLocal)
+    args = SimpleNamespace(run="jaredpalmer/kev-0.8b", remote=None, device="cpu", raw_logits=True,
+                           model="kev-latest", api_key="local")
+    checks.build_predictor(args)
+    assert captured["context"] == SERVING_CONTEXT and captured["context"]["max_state"] != CONTEXT["max_state"]
+    assert captured["temperature"] == 1.0 and captured["device"] == "cpu"
+    args.raw_logits = False
+    checks.build_predictor(args)
+    assert captured["temperature"] is None
+    with pytest.raises(SystemExit, match="remote endpoint"):
+        checks.build_predictor(SimpleNamespace(run=None, remote="http://example.invalid", raw_logits=True,
+                                               device="cpu", model="kev-latest", api_key="local"))
+
+    def refuse(args):
+        raise AssertionError("checkpoint loaded")
+
+    monkeypatch.setattr(checks, "build_predictor", refuse)
+    (tmp_path / "empty.jsonl").write_text("\n\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="no rows"):
+        checks.main(["--run", "unused", "--data", str(tmp_path / "empty.jsonl")])
+    with pytest.raises(SystemExit, match="--levels is 4"):
+        checks.main(["--run", "unused", "--levels", "4", "--level-texts", "a,b,c"])
+    with pytest.raises(SystemExit, match="--levels must be >= 1"):
+        checks.main(["--run", "unused", "--levels", "0"])
+
+    monkeypatch.setattr(checks, "build_predictor", lambda args: predict)
+    assert checks.main(["--run", "unused", "--states", "1", "--orders-max", "1"]) == 0
+    assert sorted(seen[0]) == ["high", "low", "medium"] and seen[-1] == ["low", "low", "low"]
+    assert len(seen) == 2                                                    # one sampled order + the control
+    seen.clear()
+    assert checks.main(["--run", "unused", "--levels", "4", "--states", "1", "--orders-max", "2"]) == 0
+    assert all(sorted(row) == ["level 1", "level 2", "level 3", "level 4"] for row in seen[:-1])
+    assert seen[-1] == ["level 1"] * 4 and len(seen) == 3                    # 2 orders + one control call

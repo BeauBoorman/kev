@@ -4,7 +4,9 @@ Kev's order tooling targets Choice (`/v1/systemone/permute`, `--perm_kl`, kev.ev
 `kev.benchmark --rotations`); nothing measures order sensitivity on Score. This script ports the two checks
 jaredpalmer/kev#161 ran by hand, in the style of laya's research/eval/presentation_checks.py
 (NandhaKishorM/laya#259), against the same predictor interface kev.benchmark uses (a request record in,
-probabilities out), so a checkpoint (LocalPredictor) and an endpoint (RemotePredictor) are measured the same way:
+probabilities out), so a checkpoint (LocalPredictor) and an endpoint (RemotePredictor) are measured the same way.
+A checkpoint is scored at kev.suite.SERVING_CONTEXT, the window kev.serve admits and the one #161 measured in.
+LocalPredictor's own default is the 384-token training context, which would refuse a state the endpoint accepts.
 
 - first-slot rate: the same Score question is asked over every order of its K levels (all K! orders when that is
   at most --orders-max, else that many orders sampled without building K!) on --states states. The decision is
@@ -33,8 +35,8 @@ import math
 import random
 import sys
 
-from kev.api import question_keys
-from kev.suite import read_jsonl, write_json
+from kev.api import MAX_OPTIONS, question_keys
+from kev.suite import SERVING_CONTEXT, read_jsonl, write_json
 
 QID = "score_q"
 INSTRUCTIONS = "Answer the question using the scale defined by the levels."
@@ -114,11 +116,16 @@ def _read(answer, qid, criteria, space):
 
 
 def _decide(predictor, state, criteria, spaces):
+    """The first space the answer actually carries, in option order. NaN and infinities are refused: max() does not
+    order NaN, and an infinity makes the identical-option difference NaN."""
     answer = predictor(score_request(state, criteria))
     for space in spaces:
         values = _read(answer, QID, criteria, space)
-        if values is not None:
-            return values, space
+        if values is None:
+            continue
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError(f"predictor returned a non-finite {space} value for {QID}")
+        return values, space
     raise ValueError(f"predictor returned neither {' nor '.join(spaces)} for {QID}")
 
 
@@ -206,17 +213,41 @@ def measure(predictor, level_texts, states, orders_max=120):
             "caveat": ORDERED_SCALE_CAVEAT}
 
 
+def resolve_level_texts(levels, texts):
+    """The level texts the flags name.
+
+    --level-texts, when given, is the question (and a --levels that disagrees with its length is an error, so the two
+    flags cannot silently measure different K). With no texts, --levels is the count: the three urgency words at 3
+    (the default, and #161's set), otherwise "level 1" .. "level N". Omitting both is those three words."""
+    if texts is not None:
+        chosen = [text.strip() for text in texts.split(",") if text.strip()]
+        if not chosen:
+            raise SystemExit("--level-texts must name at least one level")
+        if levels is not None and levels != len(chosen):
+            raise SystemExit(f"--levels is {levels} but --level-texts names {len(chosen)}")
+        return chosen
+    count = 3 if levels is None else levels
+    if count == 3:
+        return [text.strip() for text in DEFAULT_LEVEL_TEXTS.split(",")]
+    return [f"level {i + 1}" for i in range(count)]
+
+
 def build_predictor(args):
     """The predictor the flags name: LocalPredictor(--run) or RemotePredictor(--remote), exactly what
-    kev.benchmark scores with. Imported lazily so the checks themselves stay importable without a checkpoint."""
+    kev.benchmark scores with. A checkpoint is loaded at SERVING_CONTEXT so a state the endpoint would score is not
+    refused at the 384-token training window. Imported lazily so the checks themselves stay importable without a
+    checkpoint."""
     if bool(args.run) == bool(args.remote):
         raise SystemExit("pass exactly one of --run <dir|hub-id> or --remote <url>")
+    if args.raw_logits and not args.run:
+        raise SystemExit("--raw-logits scores a checkpoint at temperature 1.0; a remote endpoint returns probabilities")
     from kev.device import default_device
     if args.run:
         from kev.checkpoint import LoadOptions
         from kev.predictors import LocalPredictor
         temperature = 1.0 if args.raw_logits else None
-        return LocalPredictor(args.run, args.device or default_device(), opts=LoadOptions(temperature=temperature))
+        return LocalPredictor(args.run, args.device or default_device(), opts=LoadOptions(temperature=temperature),
+                              context=SERVING_CONTEXT)
     from kev.predictors import RemotePredictor
     return RemotePredictor(args.remote, model=args.model, api_key=args.api_key)
 
@@ -231,9 +262,11 @@ def main(argv=None):
     parse.add_argument("--device", help="what LocalPredictor loads onto (default: kev.device.default_device())")
     parse.add_argument("--raw-logits", action="store_true",
                        help="score --run at head temperature 1.0 (the issue's \"raw\" column) instead of the checkpoint's")
-    parse.add_argument("--levels", type=int, default=3, help="how many levels the Score question has")
-    parse.add_argument("--level-texts", default=DEFAULT_LEVEL_TEXTS,
-                       help=f"comma-separated level texts (default: {DEFAULT_LEVEL_TEXTS}); --levels is ignored then")
+    parse.add_argument("--levels", type=int, default=None,
+                       help="how many levels, when --level-texts is omitted (default 3: low, medium, high; "
+                            "any other count is level 1 .. N). With --level-texts, the texts decide and a different count is an error")
+    parse.add_argument("--level-texts", default=None,
+                       help=f"comma-separated level texts (default, for 3 levels: {DEFAULT_LEVEL_TEXTS})")
     parse.add_argument("--states", type=int, default=20,
                        help="how many states to ask over (the first this many rows of --data)")
     parse.add_argument("--data", help="a JSONL of records whose \"state\" fields replace the built-in templates")
@@ -244,24 +277,28 @@ def main(argv=None):
     parse.add_argument("--out", help="write the JSON report here (kev.suite.write_json)")
     args = parse.parse_args(argv)
 
-    if args.levels < 1:
+    if args.levels is not None and args.levels < 1:
         raise SystemExit("--levels must be >= 1")
     if args.states < 1:
         raise SystemExit("--states must be >= 1")
     if args.orders_max < 1:
         raise SystemExit("--orders-max must be >= 1")
-    level_texts = [t.strip() for t in args.level_texts.split(",") if t.strip()] if args.level_texts else []
-    if not level_texts:
-        level_texts = [f"level {i + 1}" for i in range(args.levels)]
+    level_texts = resolve_level_texts(args.levels, args.level_texts)
+    if not 1 <= len(level_texts) <= MAX_OPTIONS:
+        raise SystemExit(f"a Score question has 1..{MAX_OPTIONS} levels, got {len(level_texts)}")
     if len(set(level_texts)) != len(level_texts):
-        raise SystemExit("--level-texts must be distinct (the identical-option control needs one text to repeat)")
+        raise SystemExit("--level-texts must be distinct")
 
-    # Slice and check --data before loading a checkpoint: a bad file should fail before the weights do.
+    # Slice and check --data before loading a checkpoint: a bad file, including an empty one, fails before the weights do.
     states = build_states(args.states, read_jsonl(args.data) if args.data else None)
+    if not states:
+        raise SystemExit("--data has no rows")
     predictor = build_predictor(args)
     report = measure(predictor, level_texts, states, orders_max=args.orders_max)
     report["target"] = args.run or args.remote
     report["raw_logits"] = bool(args.raw_logits and args.run)
+    if args.run:
+        report["context"] = {key: SERVING_CONTEXT[key] for key in ("max_state", "max_branch", "max_packed")}
     print(json.dumps(report, indent=2))
     if args.out:
         write_json(args.out, report)
