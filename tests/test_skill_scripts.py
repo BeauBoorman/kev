@@ -126,6 +126,19 @@ def test_dedupe_still_detects_conflicts_with_reordered_criteria_keys():
     assert split_data.dedupe(rows) == ([], 0, 1)
 
 
+def test_label_table_counts_each_question_definition():
+    short = {"type": "score", "instructions": "Rate it", "criteria": ["bad", "good"], "label": 1}
+    long = {"type": "score", "instructions": "Rate it", "criteria": ["bad", "neutral", "good"], "label": 1}
+    rows = [{"state": "same", "questions": {"rating": q}} for q in (short, long)]
+    table = split_data.label_table(rows)
+    assert table["rating (2 levels)"] == Counter({"1": 1})
+    assert table["rating (3 levels)"] == Counter({"1": 1})
+    warnings = {w.split(":")[0]: w for w in split_data.warnings_for(rows)}
+    assert "['0']" in warnings["question 'rating (2 levels)'"]
+    assert "['0', '2']" in warnings["question 'rating (3 levels)'"]
+    assert set(split_data.label_table([record("x")])) == {"department", "escalate", "frustration"}
+
+
 def test_split_cli_keeps_question_variants_in_the_same_partition(tmp_path, monkeypatch):
     rows = [{"state": f"case {i}", "questions": {"rating": {
         "type": "score", "instructions": "Rate the experience", "criteria": levels, "label": len(levels) - 1}}}
@@ -136,6 +149,8 @@ def test_split_cli_keeps_question_variants_in_the_same_partition(tmp_path, monke
     assert split_data.main() == 0
     summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert summary["records"] == 120 and summary["conflicting_states_dropped"] == 0
+    for part in summary["partitions"].values():
+        assert set(part["labels"]) == {"rating (2 levels)", "rating (3 levels)"}
     states = []
     for name in ("train", "calibration", "development"):
         part = [json.loads(line) for line in (out / f"{name}.jsonl").read_text(encoding="utf-8").splitlines()]

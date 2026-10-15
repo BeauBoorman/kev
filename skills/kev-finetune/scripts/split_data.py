@@ -11,8 +11,9 @@ One record per line, in the System One request shape plus a `label` on every que
                                    "priority": {"type": "score", "instructions": "...", "criteria": ["low", "medium", "high"], "label": 2}}}
 
 Records with the same state always land in the same partition, so a calibration or development score is never inflated
-by a state the model trained on. Exact duplicates are dropped; the same state with different labels for the same
-question is reported as a conflict and the whole record is dropped. Standard library only; the tokenizer-level check
+by a state the model trained on. Exact duplicates are dropped. Two labels for one question definition on the same
+state are a conflict and both records are dropped. A definition is the question id plus its type, instructions and
+criteria, so two rubrics that share a state are kept. Standard library only; the tokenizer-level check
 (Kev's 384-token state / 2048-token request limits) happens on Modal (kev_modal.py::validate) or at the start of training.
 """
 import argparse
@@ -107,8 +108,13 @@ def read_records(path):
     return records, problems
 
 
+def question_form(q):
+    """Type, instructions and criteria, without the label. Reordered criteria keys are one form."""
+    return json.dumps({k: q.get(k) for k in ("type", "instructions", "criteria")}, sort_keys=True)
+
+
 def dedupe(records):
-    """Drop exact duplicates and records whose state carries conflicting labels for the same question."""
+    """Drop exact duplicates, and a state that carries two labels for one question form."""
     seen, by_state, conflicts = set(), defaultdict(dict), set()
     kept = []
     for r in records:
@@ -117,8 +123,7 @@ def dedupe(records):
         seen.add(fingerprint)
         key = state_key(r["state"])
         for qid, q in r["questions"].items():
-            question = json.dumps({k: q.get(k) for k in ("type", "instructions", "criteria")}, sort_keys=True)
-            previous = by_state[key].setdefault((qid, question), label_key(q))
+            previous = by_state[key].setdefault((qid, question_form(q)), label_key(q))
             if previous != label_key(q): conflicts.add(key)
         kept.append(r)
     dropped_dupes = len(records) - len(kept)
@@ -126,13 +131,47 @@ def dedupe(records):
     return kept, dropped_dupes, len(conflicts)
 
 
-def label_table(records):
-    """{qid: Counter(label key)} over all records."""
-    table = defaultdict(Counter)
+def _histogram_name(qid, q, taken):
+    criteria = q.get("criteria")
+    if q.get("type") == "score" and isinstance(criteria, list):
+        base = f"{qid} ({len(criteria)} levels)"
+    elif q.get("type") == "choice" and isinstance(criteria, dict):
+        base = f"{qid} ({len(criteria)} options)"
+    else:
+        base = f"{qid} ({q.get('type')})"
+    n = taken.get(base, 0) + 1
+    taken[base] = n
+    return base if n == 1 else f"{base} #{n}"
+
+
+def label_groups(records):
+    """(name, sample question, Counter) per question form.
+
+    One form keeps the question id, so a normal file's summary is unchanged. A second form of that id gets its own
+    name, and its level indices are not added to the first form's counts."""
+    grouped = defaultdict(list)
     for r in records:
         for qid, q in r["questions"].items():
-            table[qid][label_key(q)] += 1
-    return table
+            grouped[(qid, question_form(q))].append(q)
+    per_qid = defaultdict(list)
+    for (qid, form), qs in grouped.items():
+        per_qid[qid].append((form, qs))
+    rows = []
+    for qid in sorted(per_qid):
+        forms = sorted(per_qid[qid])
+        if len(forms) == 1:
+            qs = forms[0][1]
+            rows.append((qid, qs[0], Counter(label_key(q) for q in qs)))
+            continue
+        taken = {}
+        for _, qs in forms:
+            rows.append((_histogram_name(qid, qs[0], taken), qs[0], Counter(label_key(q) for q in qs)))
+    return rows
+
+
+def label_table(records):
+    """{name: Counter(label key)}. The name is the question id when that id has one form."""
+    return {name: counts for name, _, counts in label_groups(records)}
 
 
 def split(records, fractions, seed):
@@ -151,17 +190,15 @@ def warnings_for(records):
     out = []
     long_states = sum(render_length(r["state"]) > STATE_CHARS_WARN for r in records)
     if long_states: out.append(f"{long_states} states are longer than {STATE_CHARS_WARN} characters; the trainer drops requests over 384 state tokens")
-    for qid, counts in sorted(label_table(records).items()):
+    for name, sample, counts in label_groups(records):
         total = sum(counts.values())
         rare = [k for k, c in counts.items() if c / total < 0.05]
-        if rare: out.append(f"question {qid!r}: labels {rare} are under 5% of {total} records; add more or the model will rarely predict them")
-        expected = None
-        sample = next(q for r in records for q2, q in r["questions"].items() if q2 == qid)
+        if rare: out.append(f"question {name!r}: labels {rare} are under 5% of {total} records; add more or the model will rarely predict them")
         if sample["type"] == "choice": expected = set(sample["criteria"])
         elif sample["type"] == "noul": expected = {"true", "false"}
         else: expected = {str(i) for i in range(len(sample["criteria"]))}
         missing = expected - set(counts)
-        if missing: out.append(f"question {qid!r}: no record is labelled {sorted(missing)}; the model cannot learn options it never sees as correct")
+        if missing: out.append(f"question {name!r}: no record is labelled {sorted(missing)}; the model cannot learn options it never sees as correct")
     return out
 
 
