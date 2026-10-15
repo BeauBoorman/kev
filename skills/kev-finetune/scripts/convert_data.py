@@ -6,7 +6,8 @@
 
 The workload spec supplies the questions (type, instructions, criteria); this script supplies the state and labels from
 your columns. Labels are matched to the question's options case-insensitively (`--map` handles renames); yes/no/1/0/
-true/false become noul labels; score labels may be level indices, 1-based ratings (`--score-offset 1`) or level texts.
+true/false become noul labels; score labels may be whole-number level indices, 1-based ratings (`--score-offset 1`) or level texts.
+A fractional or non-finite number is skipped, not truncated.
 Rows whose label cannot be mapped are counted by reason and skipped. Standard library only. Next: split_data.py.
 """
 import argparse
@@ -62,12 +63,15 @@ def map_label(q, value, mapping, score_offset):
     levels = q["criteria"]
     try:
         number = Decimal(text)
-        if not number.is_finite() or number != number.to_integral_value():
-            return None, "score must be a finite integer index"
-        return (int(number) - score_offset, None) if score_offset <= number < score_offset + len(levels) else (None, f"level outside 0..{len(levels) - 1} after --score-offset {score_offset}")
     except InvalidOperation:
         hits = [i for i, lvl in enumerate(levels) if str(lvl).casefold() == text.casefold() or str(lvl).casefold().startswith(text.casefold() + ":")]
         return (hits[0], None) if len(hits) == 1 else (None, "not a level (index or level text)")
+    if not number.is_finite() or number != number.to_integral_value():
+        return None, "score must be a finite integer index"
+    # Range first. int() of a finite integral Decimal such as 1e9999999 builds a multi-million-digit int.
+    if not score_offset <= number < score_offset + len(levels):
+        return None, f"level outside 0..{len(levels) - 1} after --score-offset {score_offset}"
+    return int(number) - score_offset, None
 
 
 def main():
