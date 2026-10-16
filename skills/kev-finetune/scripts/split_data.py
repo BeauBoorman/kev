@@ -13,7 +13,8 @@ One record per line, in the System One request shape plus a `label` on every que
 Records with the same state always land in the same partition, so a calibration or development score is never inflated
 by a state the model trained on. Exact duplicates are dropped. Two labels for one question definition on the same
 state are a conflict and both records are dropped. A definition is the question id plus its type, instructions and
-criteria, so two rubrics that share a state are kept. Standard library only; the tokenizer-level check
+criteria, so two rubrics that share a state are kept. summary.json keeps the question id when that id has one
+definition, in the order the ids first appear. Standard library only; the tokenizer-level check
 (Kev's 384-token state / 2048-token request limits) happens on Modal (kev_modal.py::validate) or at the start of training.
 """
 import argparse
@@ -131,47 +132,62 @@ def dedupe(records):
     return kept, dropped_dupes, len(conflicts)
 
 
-def _histogram_name(qid, q, taken):
+def _form_name(qid, q, taken, used):
     criteria = q.get("criteria")
-    if q.get("type") == "score" and isinstance(criteria, list):
-        base = f"{qid} ({len(criteria)} levels)"
-    elif q.get("type") == "choice" and isinstance(criteria, dict):
-        base = f"{qid} ({len(criteria)} options)"
-    else:
-        base = f"{qid} ({q.get('type')})"
-    n = taken.get(base, 0) + 1
+    if q.get("type") == "score" and isinstance(criteria, list): base = f"{qid} ({len(criteria)} levels)"
+    elif q.get("type") == "choice" and isinstance(criteria, dict): base = f"{qid} ({len(criteria)} options)"
+    else: base = f"{qid} ({q.get('type')})"
+    n = taken.get(base, 0)
+    while True:
+        n += 1
+        name = base if n == 1 else f"{base} #{n}"
+        if name not in used: break
     taken[base] = n
-    return base if n == 1 else f"{base} #{n}"
+    used.add(name)
+    return name
 
 
-def label_groups(records):
-    """(name, sample question, Counter) per question form.
+def _assign_names(sample):
+    """(qid, form) -> summary name. `sample` is the first question of each form, in first-seen order.
 
-    One form keeps the question id, so a normal file's summary is unchanged. A second form of that id gets its own
-    name, and its level indices are not added to the first form's counts."""
-    grouped = defaultdict(list)
+    An id with one form keeps the id. Further forms are named `rating (2 levels)`, and a name that is already an id
+    or another form's name gets ` #2`. Question ids are reserved first, then the other forms are named in id order,
+    so the suffix does not depend on which row came first."""
+    by_qid = {}
+    for qid, form in sample: by_qid.setdefault(qid, []).append(form)
+    used = {qid for qid, forms in by_qid.items() if len(forms) == 1}
+    names = {(qid, forms[0]): qid for qid, forms in by_qid.items() if len(forms) == 1}
+    for qid, forms in sorted((qid, forms) for qid, forms in by_qid.items() if len(forms) > 1):
+        taken = {}
+        for form in sorted(forms):
+            names[(qid, form)] = _form_name(qid, sample[(qid, form)], taken, used)
+    return names
+
+
+def form_names(records):
+    """Summary name of every (question id, form) in `records`. Pass the whole run, then reuse it per partition."""
+    sample = {}
     for r in records:
         for qid, q in r["questions"].items():
-            grouped[(qid, question_form(q))].append(q)
-    per_qid = defaultdict(list)
-    for (qid, form), qs in grouped.items():
-        per_qid[qid].append((form, qs))
-    rows = []
-    for qid in sorted(per_qid):
-        forms = sorted(per_qid[qid])
-        if len(forms) == 1:
-            qs = forms[0][1]
-            rows.append((qid, qs[0], Counter(label_key(q) for q in qs)))
-            continue
-        taken = {}
-        for _, qs in forms:
-            rows.append((_histogram_name(qid, qs[0], taken), qs[0], Counter(label_key(q) for q in qs)))
-    return rows
+            sample.setdefault((qid, question_form(q)), q)
+    return _assign_names(sample)
 
 
-def label_table(records):
+def label_groups(records, names=None):
+    """(name, sample question, Counter) per question form, in the order the question ids first appear."""
+    grouped = {}
+    for r in records:
+        for qid, q in r["questions"].items():
+            key = (qid, question_form(q))
+            if key not in grouped: grouped[key] = [q, Counter()]
+            grouped[key][1][label_key(q)] += 1
+    if names is None: names = _assign_names({key: sample for key, (sample, _) in grouped.items()})
+    return [(names[key], sample, counts) for key, (sample, counts) in grouped.items()]
+
+
+def label_table(records, names=None):
     """{name: Counter(label key)}. The name is the question id when that id has one form."""
-    return {name: counts for name, _, counts in label_groups(records)}
+    return {name: counts for name, _, counts in label_groups(records, names)}
 
 
 def split(records, fractions, seed):
@@ -186,11 +202,11 @@ def split(records, fractions, seed):
     return {name: [r for k in ks for r in groups[k]] for name, ks in parts.items()}
 
 
-def warnings_for(records):
+def warnings_for(records, names=None):
     out = []
     long_states = sum(render_length(r["state"]) > STATE_CHARS_WARN for r in records)
     if long_states: out.append(f"{long_states} states are longer than {STATE_CHARS_WARN} characters; the trainer drops requests over 384 state tokens")
-    for name, sample, counts in label_groups(records):
+    for name, sample, counts in sorted(label_groups(records, names), key=lambda row: row[0]):
         total = sum(counts.values())
         rare = [k for k, c in counts.items() if c / total < 0.05]
         if rare: out.append(f"question {name!r}: labels {rare} are under 5% of {total} records; add more or the model will rarely predict them")
@@ -221,18 +237,24 @@ def main():
     records, dupes, conflicts = dedupe(records)
     if not records:
         print("no valid records", file=sys.stderr); return 1
+    # Names come from every record the run will write. A partition that holds only one of two forms then uses the
+    # same name as the rest of the summary, and a holdout rubric is not keyed as if it were the training rubric.
+    holdout_rows, holdout_problems = [], []
+    if a.out and a.holdout:
+        holdout_rows, holdout_problems = read_records(a.holdout)
+        holdout_rows, _, _ = dedupe(holdout_rows)
+    names = form_names(records + holdout_rows)
     print(f"{len(records)} valid records ({len(problems)} invalid lines, {dupes} exact duplicates dropped, {conflicts} states with conflicting labels dropped)")
     types = Counter(q["type"] for r in records for q in r["questions"].values())
     print(f"questions by type: {dict(types)}; states: {len({state_key(r['state']) for r in records})} distinct")
-    for qid, counts in sorted(label_table(records).items()):
+    for qid, counts in sorted(label_table(records, names).items()):
         print(f"  {qid}: " + ", ".join(f"{k}={c}" for k, c in counts.most_common()))
-    for w in warnings_for(records): print(f"warning: {w}")
+    for w in warnings_for(records, names): print(f"warning: {w}")
 
     if not a.out: return 0
     if a.holdout:
-        real, real_problems = read_records(a.holdout)
-        for p in real_problems[:10]: print(f"invalid in holdout: {p}", file=sys.stderr)
-        real, _, _ = dedupe(real)
+        for p in holdout_problems[:10]: print(f"invalid in holdout: {p}", file=sys.stderr)
+        real = holdout_rows
         if len(real) < 40: print(f"warning: only {len(real)} real records; calibration and development will be noisy (aim for 100+ each)", file=sys.stderr)
         real_parts = split(real, {"calibration": 0.5, "development": 0.5}, a.seed)
         real_states = {state_key(r["state"]) for r in real}
@@ -250,7 +272,7 @@ def main():
     for name, rows in parts.items():
         with (out / f"{name}.jsonl").open("w", encoding="utf-8", newline="\n") as f:
             for r in rows: f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        summary["partitions"][name] = {"records": len(rows), "labels": {qid: dict(c) for qid, c in label_table(rows).items()}}
+        summary["partitions"][name] = {"records": len(rows), "labels": {qid: dict(c) for qid, c in label_table(rows, names).items()}}
         print(f"wrote {out / f'{name}.jsonl'}: {len(rows)} records")
     (out / "summary.json").write_text(json.dumps(summary, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
     return 0

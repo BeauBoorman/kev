@@ -64,6 +64,8 @@ development; below that the temperature fit and the scores are unstable.
 
 Map each source row to one record. Keep the model's `instructions` and `criteria` constant across records (put them in
 a small Python dict and reuse it). A file with two definitions of one id is not a label conflict.
-`split_data.py` counts each definition's labels on its own. Convert labels to the required type: routing names -> `choice` option names, flags ->
+`split_data.py` counts each definition on its own. One definition keeps the question id, in the order the ids first
+appear. A second is named `rating (2 levels)`, or `answer (2 options) #2` when that name is already used, and every
+partition uses that same name. Convert labels to the required type: routing names -> `choice` option names, flags ->
 `noul` booleans, ratings -> `score` indices (subtract 1 if your scale starts at 1). Then run
 `python3 scripts/split_data.py yours.jsonl` to validate before splitting.
